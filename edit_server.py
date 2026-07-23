@@ -10,6 +10,21 @@ part of any editable region, and every save verifies that line is
 byte-identical before the file is written. Writes are atomic (temp file +
 rename). Nothing is committed or pushed -- review with `git diff`.
 
+Save-path hardening (2026-07-23, after the first real session corrupted the
+file -- see ledg/notes/FireSense_Data_Snapshots site.md):
+  * <script>/<style> regions are excluded from scanning, so no data-eid can
+    land in renderNode()'s HTML template strings and file-tree rows can
+    never become editable;
+  * every submitted edit must carry the element's pre-edit baseline, which
+    the server verifies byte-for-byte against the source offsets -- edits
+    from JS-rendered or stale DOM are rejected;
+  * editor-injected attributes (contenteditable, data-eid, spellcheck,
+    fs-dirty) are stripped client- and server-side before writing;
+  * contenteditable typing artifacts are normalized: <div>/<p> blocks the
+    browser inserts on Enter become proper sibling paragraphs (for <p>
+    regions) or <br> (elsewhere), and a fully-deleted element is saved
+    genuinely empty, with a warning surfaced in the UI.
+
 Usage:
     python3 edit_server.py [index.html]
 
@@ -60,7 +75,7 @@ PATTERNS = [
     r'<span class="kpi-sub">(.*?)</span>',
     r'<div class="cat-name">(.*?)</div>',
     r'<span class="cat-desc">(.*?)</span>',
-    r'<th[^>]*>(.*?)</th>',
+    r'<th\b[^>]*>(.*?)</th>',                          # \b: must NOT match <thead>
     r'<td class="num">(.*?)</td>',
     r'<td class="lbl">(.*?)</td>',
     r'<td class="n">(.*?)</td>',
@@ -83,18 +98,30 @@ def blob_line(text):
     raise RuntimeError("tree-data blob line not found in %s" % TARGET)
 
 
+def forbidden_zones(text):
+    """Offset ranges no editable span may touch: every <script> element
+    (the JSON tree blob AND the page's own JS -- whose renderNode() template
+    holds HTML-looking string literals that the whitelist patterns would
+    otherwise match) and every <style> element."""
+    zones = []
+    for pat in (r"<script\b.*?</script>", r"<style\b.*?</style>"):
+        for m in re.finditer(pat, text, re.DOTALL | re.IGNORECASE):
+            zones.append(m.span())
+    return zones
+
+
 def scan(text):
     """Find editable spans. Returns list of (start, end) inner-HTML offsets,
-    sorted, with any span nested inside another dropped, and none inside
-    the blob line."""
-    bstart = text.index(BLOB_MARK)
-    bend = text.index("\n", bstart)
+    sorted, with any span nested inside another dropped, and none touching
+    a <script>/<style> region (which includes the JSON blob line)."""
+    text.index(BLOB_MARK)  # fail fast if the blob is missing
+    zones = forbidden_zones(text)
     spans = []
     for pat in PATTERNS:
         for m in re.finditer(pat, text, re.DOTALL):
             s, e = m.span(1)
-            if s >= bstart and s < bend:
-                continue  # never inside the blob line (defensive; none match)
+            if any(s < ze and e > zs for zs, ze in zones):
+                continue  # inside <script>/<style>: JS/CSS source, not page text
             spans.append((s, e))
     spans.sort()
     keep = []
@@ -122,6 +149,74 @@ def encode_entities(s):
         else:
             out.append("&#x%X;" % cp)
     return "".join(out)
+
+
+# --- save-path sanitizing / normalizing (the 2026-07-23 hardening) ---------
+
+EDITOR_ATTR_RE = re.compile(
+    r"\s+(?:contenteditable|spellcheck|data-eid)"
+    r"(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+))?(?=[\s/>])",
+    re.IGNORECASE,
+)
+
+
+def strip_editor_state(v):
+    """Remove editor-injected attributes (contenteditable, data-eid,
+    spellcheck) and the fs-dirty class from every start tag in a submitted
+    edit, so no editor runtime state can be persisted into the file."""
+
+    def clean_tag(m):
+        tag = EDITOR_ATTR_RE.sub("", m.group(0))
+
+        def declass(cm):
+            toks = [t for t in cm.group(1).split() if t != "fs-dirty"]
+            return ' class="%s"' % " ".join(toks) if toks else ""
+
+        return re.sub(r'\s+class="([^"]*)"', declass, tag)
+
+    return re.sub(r"<[a-zA-Z][^>]*>", clean_tag, v)
+
+
+# Block boundaries that contenteditable inserts on Enter: browsers wrap new
+# lines in <div> (or sometimes <p>) children. None of the whitelisted static
+# regions legitimately contains a nested <div>/<p>, so any such boundary in
+# an edit is a typing artifact to normalize.
+BLOCK_BOUNDARY_RE = re.compile(
+    r"</(?:div|p)>\s*<(?:div|p)\b[^>]*>|<(?:div|p)\b[^>]*>|</(?:div|p)>",
+    re.IGNORECASE,
+)
+BLANK_HTML_RE = re.compile(r"(?:<br\s*/?>|&nbsp;|\s)+", re.IGNORECASE)
+
+
+def normalize_artifacts(v, start_tag, indent, tag, eid, warnings):
+    """Normalize contenteditable typing artifacts in an edited innerHTML:
+    split on browser-inserted <div>/<p> block boundaries, drop blank filler
+    blocks (<div><br></div> and the like), and rebuild clean markup -- for a
+    <p> region a real paragraph break becomes a proper sibling <p> with the
+    same attributes; elsewhere it becomes <br>. A fully-emptied element is
+    saved genuinely empty and flagged."""
+    if BLOCK_BOUNDARY_RE.search(v):
+        blocks = BLOCK_BOUNDARY_RE.split(v)
+    else:
+        blocks = [v]
+    blocks = [b for b in blocks if BLANK_HTML_RE.sub("", b) != ""]
+    if not blocks:
+        warnings.append(
+            "element %s was emptied: saved as a genuinely empty <%s> "
+            "(remove the element from the source if that was the intent)" % (eid, tag))
+        return ""
+    if len(blocks) == 1:
+        return blocks[0]
+    if tag == "p":
+        sep = "</p>\n%s%s" % (indent, start_tag)
+        warnings.append(
+            "element %s: line break normalized into %d separate <p> paragraphs"
+            % (eid, len(blocks)))
+    else:
+        sep = "<br>"
+        warnings.append(
+            "element %s: line break normalized to <br> inside <%s>" % (eid, tag))
+    return sep.join(b.strip() for b in blocks)
 
 
 EDITOR = r"""
@@ -158,10 +253,38 @@ EDITOR = r"""
 <script>
 (function(){
   var base = document.documentElement.getAttribute('data-fs-hash');
-  var els = Array.prototype.slice.call(document.querySelectorAll('[data-eid]'));
+  var count = parseInt(document.documentElement.getAttribute('data-fs-count') || '0', 10);
+  // Only trust elements whose data-eid the server stamped into the static
+  // page source: in-range, unique in the document, with no nested editable.
+  // Anything else (e.g. rows produced by the file-tree renderer) must never
+  // become editable -- that is how the 2026-07-23 corruption happened.
+  var seen = {};
+  Array.prototype.forEach.call(document.querySelectorAll('[data-eid]'), function(el){
+    var id = el.dataset.eid;
+    seen[id] = seen.hasOwnProperty(id) ? 'dup' : el;
+  });
+  var els = [];
+  Object.keys(seen).forEach(function(id){
+    var n = parseInt(id, 10);
+    if(seen[id] === 'dup' || isNaN(n) || n < 0 || n >= count) return;
+    if(seen[id].querySelector('[data-eid]')) return;
+    els.push(seen[id]);
+  });
+  function cleanHTML(el){
+    // innerHTML with all editor-injected state removed (server strips too)
+    var c = el.cloneNode(true);
+    Array.prototype.forEach.call(c.querySelectorAll('*'), function(n){
+      n.removeAttribute('contenteditable');
+      n.removeAttribute('data-eid');
+      n.removeAttribute('spellcheck');
+      n.classList.remove('fs-dirty');
+      if(!n.getAttribute('class')) n.removeAttribute('class');
+    });
+    return c.innerHTML;
+  }
   var orig = {};
   els.forEach(function(el){
-    orig[el.dataset.eid] = el.innerHTML;
+    orig[el.dataset.eid] = cleanHTML(el); // pre-edit baseline, echoed on save
     el.contentEditable = true; // rich edits allowed; inline markup like <b> preserved
     el.spellcheck = true;
     el.addEventListener('input', refresh);
@@ -172,11 +295,11 @@ EDITOR = r"""
     s.addEventListener('click', function(e){ e.preventDefault(); });
   });
   function dirty(){
-    return els.filter(function(el){ return el.innerHTML !== orig[el.dataset.eid]; });
+    return els.filter(function(el){ return cleanHTML(el) !== orig[el.dataset.eid]; });
   }
   function refresh(){
     var d = dirty();
-    els.forEach(function(el){ el.classList.toggle('fs-dirty', el.innerHTML !== orig[el.dataset.eid]); });
+    els.forEach(function(el){ el.classList.toggle('fs-dirty', cleanHTML(el) !== orig[el.dataset.eid]); });
     document.getElementById('fs-count').textContent = d.length + ' changed';
   }
   function msg(t){ document.getElementById('fs-msg').textContent = t; }
@@ -184,13 +307,19 @@ EDITOR = r"""
     var d = dirty();
     if(!d.length){ msg('nothing to save'); return; }
     var edits = {};
-    d.forEach(function(el){ edits[el.dataset.eid] = el.innerHTML; });
+    d.forEach(function(el){
+      edits[el.dataset.eid] = {html: cleanHTML(el), orig: orig[el.dataset.eid]};
+    });
     msg('saving…');
     fetch('/save', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({base: base, edits: edits})})
     .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
     .then(function(res){
-      if(res.ok){ msg('saved ✓ reloading…'); setTimeout(function(){ location.reload(); }, 400); }
+      if(res.ok){
+        if(res.j.warnings && res.j.warnings.length){
+          alert('Saved, with notes:\n\n' + res.j.warnings.join('\n'));
+        }
+        msg('saved ✓ reloading…'); setTimeout(function(){ location.reload(); }, 400); }
       else { msg('SAVE FAILED: ' + (res.j.error || 'unknown')); alert('Save failed:\n' + (res.j.error || 'unknown')); }
     })
     .catch(function(e){ msg('SAVE FAILED: ' + e); });
@@ -235,26 +364,59 @@ def annotated_page():
         pos = e
     out.append(text[pos:])
     page = "".join(out)
-    page = page.replace("<html", '<html data-fs-hash="%s"' % h, 1)
+    page = page.replace(
+        "<html", '<html data-fs-hash="%s" data-fs-count="%d"' % (h, len(spans)), 1)
     page = page.replace("</body>", EDITOR + "\n</body>", 1)
     return page
 
 
 def apply_edits(base_hash, edits):
-    """Apply {eid: newInnerHTML} to the file. Atomic, blob-guarded."""
+    """Apply {eid: {html, orig}} to the file. Atomic, blob-guarded.
+
+    Every edit must carry the element's pre-edit baseline (`orig`); it is
+    verified byte-for-byte against the bytes at that element's source
+    offsets. An edit whose baseline does not round-trip to the source --
+    i.e. anything originating from JS-rendered DOM, a stale mapping, or a
+    browser-mutated region -- is rejected outright. Submitted HTML is
+    stripped of editor-injected state and normalized for contenteditable
+    typing artifacts before being written."""
     text = read_page()
     if digest(text) != base_hash:
         raise ValueError("index.html changed on disk since this page was loaded -- reload the browser tab and redo the edits")
     spans = scan(text)
     blob_before = blob_line(text)
     changes = []
+    warnings = []
     for k, v in edits.items():
         i = int(k)
         if not (0 <= i < len(spans)):
-            raise ValueError("unknown element id %s -- reload the page" % k)
-        if re.search(r"<\s*/?\s*script", v, re.I):
+            raise ValueError(
+                "element id %s is outside the %d static source-mapped regions -- save refused"
+                % (k, len(spans)))
+        if not (isinstance(v, dict) and "html" in v and "orig" in v):
+            raise ValueError(
+                "edit for element %s lacks its pre-edit baseline -- reload the page "
+                "(stale editor tab from an old server version?)" % k)
+        s, e = spans[i]
+        if encode_entities(v["orig"]) != text[s:e]:
+            raise ValueError(
+                "element %s: its on-page baseline does not match this element's source text -- "
+                "the edit did not originate from a static source-mapped region "
+                "(JS-rendered or modified DOM); save refused" % k)
+        new = strip_editor_state(v["html"])
+        if re.search(r"<\s*/?\s*script", new, re.I):
             raise ValueError("edit for element %s contains a <script> tag -- refused" % k)
-        changes.append((spans[i][0], spans[i][1], encode_entities(v)))
+        if re.search(r"data-eid|\bcontenteditable\b", new, re.I):
+            raise ValueError(
+                "edit for element %s still carries editor markup after sanitizing -- refused" % k)
+        lt = text.rfind("<", 0, s)
+        start_tag = text[lt:s]
+        tag = re.match(r"<([a-zA-Z0-9]+)", start_tag).group(1).lower()
+        line_start = text.rfind("\n", 0, lt) + 1
+        indent = re.match(r"[ \t]*", text[line_start:lt]).group(0)
+        new = encode_entities(normalize_artifacts(new, start_tag, indent, tag, k, warnings))
+        if new != text[s:e]:
+            changes.append((s, e, new))
     changes.sort(reverse=True)
     for s, e, new in changes:
         text = text[:s] + new + text[e:]
@@ -270,7 +432,7 @@ def apply_edits(base_hash, edits):
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
-    return len(changes)
+    return len(changes), warnings
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -306,9 +468,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             n = int(self.headers.get("Content-Length", "0"))
             req = json.loads(self.rfile.read(n).decode("utf-8"))
-            count = apply_edits(req["base"], req["edits"])
-            self._send(200, json.dumps({"ok": True, "applied": count}), "application/json")
+            count, warnings = apply_edits(req["base"], req["edits"])
+            self._send(200, json.dumps(
+                {"ok": True, "applied": count, "warnings": warnings}), "application/json")
             print("saved %d edit(s) -> %s" % (count, TARGET))
+            for w in warnings:
+                print("  note: %s" % w)
         except Exception as e:
             self._send(409, json.dumps({"error": str(e)}), "application/json")
             print("save rejected: %s" % e)
